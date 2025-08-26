@@ -1,0 +1,1233 @@
+package Dev.Event.PvpIntense;
+
+import java.text.SimpleDateFormat;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Date;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.StringTokenizer;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import com.l2jmega.commons.concurrent.ThreadPool;
+
+import com.l2jmega.ConfigVariables;
+import com.l2jmega.gameserver.data.ItemTable;
+import com.l2jmega.gameserver.data.NpcTable;
+import com.l2jmega.gameserver.data.SpawnTable;
+import com.l2jmega.gameserver.handler.voicedcommandhandlers.VoicedPvPFarmIntense;
+import com.l2jmega.gameserver.instancemanager.Instance;
+import com.l2jmega.gameserver.instancemanager.InstanceManager;
+import com.l2jmega.gameserver.model.L2Spawn;
+import com.l2jmega.gameserver.model.World;
+import com.l2jmega.gameserver.model.actor.Creature;
+import com.l2jmega.gameserver.model.actor.ai.CtrlIntention;
+import com.l2jmega.gameserver.model.actor.instance.Player;
+import com.l2jmega.gameserver.model.actor.template.NpcTemplate;
+import com.l2jmega.gameserver.model.item.kind.Item;
+import com.l2jmega.gameserver.util.Broadcast;
+import com.l2jmega.util.HtmlUtil;
+
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+
+public class PvPFarmIntenseManager {
+
+    private static final int TOWN_X = 83400, TOWN_Y = 148600, TOWN_Z = -3400;
+
+    private static final int[][] DEFAULT_ARENA_P1 = {
+        {-86720, -238520, -3336},
+        {-87448, -238120, -3336},
+        {-86104, -238136, -3336},
+    };
+    private static final int[][] DEFAULT_ARENA_P2 = {
+        {-86280, -238520, -3336},
+        {-87096, -238920, -3336},
+        {-86648, -238936, -3336},
+    };
+    private static final List<int[]> DEFAULT_ROOMS = new ArrayList<>();
+    static {
+        DEFAULT_ROOMS.add(new int[] {16520, 145120, -3120});
+        DEFAULT_ROOMS.add(new int[] {17120, 145560, -3120});
+        DEFAULT_ROOMS.add(new int[] {17720, 146000, -3120});
+        DEFAULT_ROOMS.add(new int[] {18320, 146440, -3120});
+        DEFAULT_ROOMS.add(new int[] {18920, 146880, -3120});
+    }
+
+    private static volatile int[][] ARENA_P1 = DEFAULT_ARENA_P1;
+    private static volatile int[][] ARENA_P2 = DEFAULT_ARENA_P2;
+    private static volatile List<int[]> FARM_ROOMS = new ArrayList<>(DEFAULT_ROOMS);
+
+    private static final long MATCH_TICK_MS = 2000L;
+    private static final boolean AWARD_ON_WIN = true;
+
+    /** Quantas lutas por página no HTML. */
+    private static volatile int PAGE_SIZE = 3;
+
+    /** Guarda (~8KB) para evitar “Insufficient Memory” no cliente. */
+    private static final int MAX_HTML_BYTES = 8000;
+
+    // seq. para ID único por duelo (aparece no HTML)
+    private static final AtomicInteger NEXT_DUEL_ID = new AtomicInteger(1);
+
+    private final Deque<Integer> queue = new ArrayDeque<>();
+    private final Map<Integer, DuelSession> duels = new ConcurrentHashMap<>(); // playerId -> session
+    private final Map<Integer, FarmSession> farms = new ConcurrentHashMap<>();
+    private final Set<Integer> busyRooms = Collections.synchronizedSet(new HashSet<>());
+    private final Set<Integer> participants = Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    private Instance inst;
+    // índice reverso: observerId -> session (para unwatch rápido)
+    private final Map<Integer, DuelSession> observerIndex = new ConcurrentHashMap<>();
+
+    private volatile boolean running = false;
+    private ScheduledFuture<?> matchmakingTask;
+
+    private volatile L2Spawn registerNpcSpawn;
+
+    private ScheduledFuture<?> autoStartTask;
+    private volatile String lastAutoStartKey = "";
+    private volatile SetOfTimes startTimesCache = new SetOfTimes();
+
+    // fim automático do EVENTO por duração (.ini)
+    private ScheduledFuture<?> eventEndTask;
+
+    private static final PvPFarmIntenseManager INSTANCE = new PvPFarmIntenseManager();
+    public static PvPFarmIntenseManager getInstance() { return INSTANCE; }
+
+    private PvPFarmIntenseManager() 
+    { 
+    	VoicedPvPFarmIntense.ensureRegistered(); // <— registra os comandos
+    	ensureAutoScheduler(); 
+    }
+
+    private static volatile int[][] REWARDS = new int[0][0];
+
+    // ======================== CONFIG RUNTIME (opcional) ========================
+
+    public static void setPageSize(int n) { PAGE_SIZE = Math.max(1, Math.min(20, n)); }
+    public static int getPageSize() { return PAGE_SIZE; }
+
+    // ======================== CICLO DO EVENTO ========================
+
+    public synchronized boolean start() {
+        if (running) return false;
+        running = true;
+
+        REWARDS  = parseRewardsToArray(ConfigVariables.EVEN_PVP_FARM_REWARDS_WINNER);
+        ARENA_P1 = parseTripleList(ConfigVariables.EVEN_PVP_FARM_ARENAS_P1, DEFAULT_ARENA_P1);
+        ARENA_P2 = parseTripleList(ConfigVariables.EVEN_PVP_FARM_ARENAS_P2, DEFAULT_ARENA_P2);
+        FARM_ROOMS = parseRoomsList(ConfigVariables.EVEN_PVP_FARM_ROOMS, DEFAULT_ROOMS);
+
+        if (ARENA_P1.length == 0 || ARENA_P2.length == 0) {
+            ARENA_P1 = DEFAULT_ARENA_P1;
+            ARENA_P2 = DEFAULT_ARENA_P2;
+        }
+
+        broadcastAll("[PvP Farm Intenso] Iniciado! Fale com o NPC em Giran para participar.");
+        spawnRegisterNpc();
+
+        matchmakingTask = ThreadPool.scheduleAtFixedRate(this::tickMatch, MATCH_TICK_MS, MATCH_TICK_MS);
+
+        if (eventEndTask != null) { try { eventEndTask.cancel(false); } catch (Throwable ignored) {} }
+        eventEndTask = ThreadPool.schedule(() -> {
+            try { stop(); } catch (Throwable ignored) {}
+        }, ConfigVariables.EVEN_PVP_FARM_EVENT_DURATION_MS);
+
+        return true;
+    }
+
+    public synchronized boolean stop() {
+        if (!running) return false;
+        running = false;
+
+        if (eventEndTask != null) { eventEndTask.cancel(false); eventEndTask = null; }
+        if (matchmakingTask != null) { matchmakingTask.cancel(false); matchmakingTask = null; }
+
+        synchronized (queue) { queue.clear(); }
+
+        for (DuelSession d : new HashSet<>(duels.values())) d.forceStop("Evento encerrado.");
+        duels.clear();
+
+        for (FarmSession f : new HashSet<>(farms.values())) f.forceStop("Evento encerrado.");
+        farms.clear();
+
+        busyRooms.clear();
+        participants.clear();
+
+        // limpa observers index
+        observerIndex.clear();
+
+        despawnRegisterNpc();
+        broadcastAll("[PvP Farm Intenso] Encerrado.");
+        return true;
+    }
+
+    // ======================== ENTRADA / SAÍDA ========================
+
+    public void join(Player player) {
+        if (player == null) return;
+
+        if (!running) {
+            player.sendMessage("O registro do PvP Farm esta fechado. Aguarde o proximo horario.");
+            return;
+        }
+
+        if (duels.containsKey(player.getObjectId()) || farms.containsKey(player.getObjectId()) || participants.contains(player.getObjectId())) {
+            player.sendMessage("Voce ja esta participando do evento.");
+            return;
+        }
+        synchronized (queue) {
+            if (queue.contains(player.getObjectId())) {
+                player.sendMessage("Voce ja esta na fila. Aguarde um oponente.");
+                return;
+            }
+        }
+
+        if (!player.destroyItemByItemId("PvPFarmEntry",
+                ConfigVariables.EVEN_PVP_FARM_ENTRY_ITEM_ID,
+                ConfigVariables.EVEN_PVP_FARM_ENTRY_ITEM_QTY,
+                player, true)) {
+            player.sendMessage("Voce nao possui a taxa (" + ConfigVariables.EVEN_PVP_FARM_ENTRY_ITEM_QTY + ").");
+            return;
+        }
+
+        synchronized (queue) { queue.addLast(player.getObjectId()); }
+        markParticipant(player.getObjectId());
+
+        player.sendMessage("Inscricao confirmada! Aguarde um oponente.");
+
+        int q; synchronized (queue) { q = queue.size(); }
+        final String allMsg = "[PvP Farm Intenso] " + player.getName() + " entrou na fila (" + q + " na fila). Fale com o NPC em Giran para participar!";
+        Broadcast.announceToOnlinePlayers(allMsg);
+    }
+
+    public void leave(Player player) {
+        if (player == null) return;
+
+        // se estiver observando, para de observar
+        stopWatching(player);
+
+        synchronized (queue) {
+            if (queue.remove(player.getObjectId())) {
+                unfreeze(player, true);
+                player.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                ThreadPool.schedule(() -> unfreeze(player, false), 300);
+                unmarkParticipant(player.getObjectId());
+                player.sendMessage("Voce saiu da fila.");
+                return;
+            }
+        }
+
+        final DuelSession d = duels.remove(player.getObjectId());
+        if (d != null) { d.forceStop("Voce saiu do evento."); return; }
+
+        final FarmSession f = farms.remove(player.getObjectId());
+        if (f != null) { f.forceStop("Voce saiu do evento."); return; }
+
+        player.sendMessage("Voce nao esta participando.");
+    }
+
+    public void info(Player p) {
+        int q; synchronized (queue) { q = queue.size(); }
+        p.sendMessage("=== PvP Farm Intenso ===");
+        p.sendMessage("Status: " + (running ? "Ativo" : "Fechado"));
+        p.sendMessage("Fila: " + q + " jogador(es). Use o NPC em Giran para participar.");
+        p.sendMessage("Taxa: " + ConfigVariables.EVEN_PVP_FARM_ENTRY_ITEM_QTY + " do item " + ConfigVariables.EVEN_PVP_FARM_ENTRY_ITEM_ID + ".");
+        p.sendMessage("Farm: " + TimeUnit.MILLISECONDS.toMinutes(ConfigVariables.EVEN_PVP_FARM_FARM_DURATION_MS) + " min.");
+        p.sendMessage("Evento ativo por: " + TimeUnit.MILLISECONDS.toMinutes(ConfigVariables.EVEN_PVP_FARM_EVENT_DURATION_MS) + " min a cada inicio.");
+
+        if (REWARDS != null && REWARDS.length > 0) {
+            p.sendMessage("Recompensas possiveis:");
+            for (int[] r : REWARDS) {
+                final int id = r[0];
+                final int min = r[1];
+                final int max = r[2];
+                final int chance = r[3];
+                final String name = getItemNameSafe(id);
+                p.sendMessage(name + " min(" + min + ") max(" + max + ") chance(" + chance + "%)");
+            }
+        } else {
+            p.sendMessage("Recompensas possiveis: nenhuma configurada.");
+        }
+    }
+
+    // ======================== MATCHMAKING ========================
+
+    private void tickMatch() {
+        if (!running) return;
+
+        Integer a = null, b = null;
+        synchronized (queue) {
+            if (queue.size() >= 2) {
+                a = queue.pollFirst();
+                b = queue.pollFirst();
+            }
+        }
+        if (a == null || b == null) return;
+
+        final Player p1 = World.getInstance().getPlayer(a);
+        final Player p2 = World.getInstance().getPlayer(b);
+
+        if (p1 == null || p2 == null || p1.isAlikeDead() || p2.isAlikeDead() || p1.isInDuel() || p2.isInDuel()) {
+            if (p1 != null) { synchronized (queue) { queue.addLast(p1.getObjectId()); } }
+            if (p2 != null) { synchronized (queue) { queue.addLast(p2.getObjectId()); } }
+            return;
+        }
+
+        final int pairCount = Math.min(ARENA_P1.length, ARENA_P2.length);
+        final int idx = ThreadLocalRandom.current().nextInt(pairCount);
+        final int[] a1 = ARENA_P1[idx];
+        final int[] a2 = ARENA_P2[idx];
+
+        final DuelSession ds = new DuelSession(p1.getObjectId(), p2.getObjectId(), a1, a2);
+        duels.put(p1.getObjectId(), ds);
+        duels.put(p2.getObjectId(), ds);
+        ds.start();
+    }
+
+    // ======================== NPC / AUTO START ========================
+
+    private static void screenAll(String text, int seconds) { broadcastAll(text); }
+
+    private void ensureAutoScheduler() {
+        if (autoStartTask != null) return;
+
+        startTimesCache.setFrom(ConfigVariables.EVEN_PVP_FARM_START_TIMES);
+
+        autoStartTask = ThreadPool.scheduleAtFixedRate(() -> {
+            try { autoStartTick(); } catch (Throwable ignored) {}
+        }, 5000L, 15000L);
+    }
+
+    private void autoStartTick() {
+        final String hours = ConfigVariables.EVEN_PVP_FARM_START_TIMES;
+        if (hours == null || hours.trim().isEmpty()) return;
+
+        if (!startTimesCache.rawEquals(hours)) {
+            startTimesCache.setFrom(hours);
+        }
+        final String now = new SimpleDateFormat("HH:mm", Locale.ENGLISH).format(new Date());
+
+        if (startTimesCache.contains(now)) {
+            final String todayKey = new SimpleDateFormat("yyyyMMdd", Locale.ENGLISH).format(new Date()) + " " + now;
+            if (!todayKey.equals(lastAutoStartKey)) {
+                lastAutoStartKey = todayKey;
+
+                if (!running) {
+                    broadcastAll("[PvP Farm Intenso] Iniciando pelo agendamento das " + now + ".");
+                    start();
+                }
+            }
+        }
+    }
+
+    private void spawnRegisterNpc() {
+        PvPFarmIntenseNpc.ensureRegistered();
+        despawnRegisterNpc();
+
+        final int npcId = ConfigVariables.EVEN_PVP_FARM_NPC_ID;
+        final int x = ConfigVariables.EVEN_PVP_FARM_NPC_X;
+        final int y = ConfigVariables.EVEN_PVP_FARM_NPC_Y;
+        final int z = ConfigVariables.EVEN_PVP_FARM_NPC_Z;
+        final int h = ConfigVariables.EVEN_PVP_FARM_NPC_H;
+
+        final NpcTemplate tpl = NpcTable.getInstance().getTemplate(npcId);
+        if (tpl == null) {
+        	broadcastAll("[PvP Farm Intenso] ERRO: NPC ID " + npcId + " nao encontrado no NpcData.");
+            return;
+        }
+        try {
+            final L2Spawn s = new L2Spawn(tpl);
+            s.setLoc(x, y, z, h);
+            s.setRespawnDelay(0);
+
+            SpawnTable.getInstance().addSpawn(s, false);
+            s.doSpawn(false);
+
+            if (s.getNpc() != null) {
+                try { s.getNpc().setIsInvul(true); } catch (Throwable ignored) {}
+                try { s.getNpc().setTitle("PvP Farm Intenso"); } catch (Throwable ignored) {}
+                try {
+                    s.getNpc().decayMe();
+                    s.getNpc().spawnMe(s.getNpc().getX(), s.getNpc().getY(), s.getNpc().getZ());
+                } catch (Throwable ignored) {}
+            }
+
+            registerNpcSpawn = s;
+            broadcastAll("[PvP Farm Intenso] NPC de inscricao disponivel em Giran!");
+        } catch (Exception e) {
+            registerNpcSpawn = null;
+            broadcastAll("[PvP Farm Intenso] Falha ao spawnar o NPC de inscricao.");
+        }
+    }
+
+    private void despawnRegisterNpc() {
+        if (registerNpcSpawn == null) return;
+        try {
+            if (registerNpcSpawn.getNpc() != null) {
+                try { registerNpcSpawn.getNpc().deleteMe(); } catch (Throwable ignored) {}
+            }
+            SpawnTable.getInstance().deleteSpawn(registerNpcSpawn, false);
+        } catch (Exception ignored) {}
+        registerNpcSpawn = null;
+    }
+
+    public void ensureRegisterNpcVisible() {
+        if (!running) return;
+        if (registerNpcSpawn == null) spawnRegisterNpc();
+    }
+
+    // ======================== OBSERVADOR / LISTAGEM ========================
+
+    /** Constrói o HTML de listagem paginada das lutas ativas a partir do template. */
+    public String buildDuelsHtml(int page) {
+        if (page < 1) page = 1;
+
+        final List<DuelSession> sessions = getActiveDuelSessionsSnapshot();
+        final int total = sessions.size();
+        final int pages = Math.max(1, (int) Math.ceil(total / (double) PAGE_SIZE));
+        if (page > pages) page = pages;
+
+        final int from = (page - 1) * PAGE_SIZE;
+        final int to   = Math.min(from + PAGE_SIZE, total);
+
+        String template = loadHtmlTemplate("data/html/mods/EventPvpIntense/pvpintense.htm");
+        if (template == null || template.isEmpty()) {
+            return buildDuelsHtmlFallback(page); // já é compacto
+        }
+        final String baseTemplate = template;
+
+        // Monta lista de forma bem compacta (linhas simples e botao curto).
+        final StringBuilder list = new StringBuilder(512);
+        if (total == 0) {
+            int fila; synchronized (queue) { fila = queue.size(); }
+            list.append("<br1>")
+                .append(fila >= 2 ? "Aguardando batalhas..." : "Sem lutas. Entre na fila!")
+                .append(" Fila: ").append(fila);
+        } else {
+            for (int i = from; i < to; i++) {
+                final DuelSession ds = sessions.get(i);
+                list.append("<tr><td align=center>")
+                    .append(HtmlUtil.escape(ds.nameA)).append(" vs ").append(HtmlUtil.escape(ds.nameB))
+                    .append(" [#").append(ds.duelId).append("] ")
+                    .append("<button value=\"Ver\" action=\"bypass -h voiced_pvpfarmwatch ").append(ds.duelId).append("\">")
+                    .append("</td></tr>");
+            }
+        }
+
+        // paginação compacta
+        final String pagination = buildPaginationBar(page, pages);
+
+        // Cabeçalho mais curto
+        template = template.replace("%TOTAL%", String.valueOf(total))
+                           .replace("%PAGE%", String.valueOf(page))
+                           .replace("%PAGES%", String.valueOf(pages));
+        // Alguns templates usam texto fixo; tenta reduzir se existir
+        template = template.replace("Lutas ativas", "Ativas")
+                           .replace("Pagina", "Pg");
+
+        // injeta lista e paginação
+        if (template.contains("%DUEL_LIST%")) template = template.replace("%DUEL_LIST%", list.toString());
+        else template = appendBeforeBodyEnd(template, list.toString());
+
+        if (template.contains("%PAGINATION%")) template = template.replace("%PAGINATION%", pagination);
+        else template = appendBeforeBodyEnd(template, pagination);
+
+        // minifica e protege tamanho
+        if (COMPACT_HTML) template = compactHtml(template);
+        if (template.getBytes(StandardCharsets.UTF_8).length > MAX_HTML_BYTES) {
+            String smallRows = "<br1><font color=FF9999>Lista truncada (HTML grande).</font>";
+            String small = baseTemplate.replace("%TOTAL%", String.valueOf(total))
+                                       .replace("%PAGE%", String.valueOf(page))
+                                       .replace("%PAGES%", String.valueOf(pages));
+            if (small.contains("%DUEL_LIST%")) small = small.replace("%DUEL_LIST%", smallRows);
+            else small = appendBeforeBodyEnd(small, smallRows);
+            if (small.contains("%PAGINATION%")) small = small.replace("%PAGINATION%", "");
+            template = COMPACT_HTML ? compactHtml(small) : small;
+        }
+        return template;
+    }
+
+
+    /** Barra de paginação com bypass `voiced_pvpfarmduels <page>` */
+    private static String buildPaginationBar(int page, int pages) {
+        if (!COMPACT_HTML) {
+            final StringBuilder sb = new StringBuilder(128);
+            sb.append("<table width=300><tr><td align=center>");
+            if (page > 1) sb.append("<button value=\"<<\" action=\"bypass -h voiced_pvpfarmduels ").append(page - 1).append("\">");
+            sb.append("&nbsp;Pg ").append(page).append("/").append(pages).append("&nbsp;");
+            if (page < pages) sb.append("<button value=\">>\" action=\"bypass -h voiced_pvpfarmduels ").append(page + 1).append("\">");
+            sb.append("</td></tr></table>");
+            return sb.toString();
+        }
+        // versão compacta sem tabela
+        StringBuilder sb = new StringBuilder(64);
+        sb.append("<br1>");
+        if (page > 1) sb.append("<button value=\"<<\" action=\"bypass -h voiced_pvpfarmduels ").append(page - 1).append("\"> ");
+        sb.append("Pg ").append(page).append("/").append(pages).append(" ");
+        if (page < pages) sb.append("<button value=\">>\" action=\"bypass -h voiced_pvpfarmduels ").append(page + 1).append("\">");
+        return sb.toString();
+    }
+
+
+    /** Carrega um arquivo HTM/HTML: tenta HtmCache via reflexão; se falhar, usa NIO. */
+    private static String loadHtmlTemplate(String path) {
+        // 1) Tenta HtmCache se existir na sua source (sem depender do import)
+        try {
+            Class<?> c = Class.forName("com.l2jmega.gameserver.data.cache");
+            Object inst = c.getMethod("getInstance").invoke(null);
+            Object res  = c.getMethod("getHtm", String.class).invoke(inst, path);
+            if (res instanceof String) {
+                String s = (String) res;
+                if (!s.isEmpty()) return s;
+            }
+        } catch (Throwable ignored) {}
+        // 2) Fallback: ler o arquivo do disco
+        try {
+            byte[] data = Files.readAllBytes(Paths.get(path));
+            return new String(data, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Se o template não tiver placeholder, injeta o bloco antes de </body>. */
+    private static String appendBeforeBodyEnd(String html, String block) {
+        int idx = html.toLowerCase().lastIndexOf("</body>");
+        if (idx == -1) idx = html.length();
+        return html.substring(0, idx) + block + html.substring(idx);
+    }
+
+    /** Fallback completo (sem template), com paginação e mensagens de fila. */
+    /** Fallback ultra-compacto (sem tabelas grandes). */
+    private String buildDuelsHtmlFallback(int page) {
+        final List<DuelSession> sessions = getActiveDuelSessionsSnapshot();
+        final int total = sessions.size();
+        final int pages = Math.max(1, (int) Math.ceil(total / (double) PAGE_SIZE));
+        if (page > pages) page = pages;
+        final int from = (page - 1) * PAGE_SIZE;
+        final int to   = Math.min(from + PAGE_SIZE, total);
+
+        final StringBuilder sb = new StringBuilder(1024);
+        sb.append("<html><body><center>");
+        sb.append("<font color=LEVEL>PvP Farm</font><br1>");
+        sb.append("<button value=\"Entrar\" action=\"bypass -h voiced_pvpfarmjoin\">");
+        sb.append(" <button value=\"Sair\" action=\"bypass -h voiced_pvpfarmleave\">");
+        sb.append(" <button value=\"Info\" action=\"bypass -h voiced_pvpfarminfo\">");
+        sb.append("<br1><font color=LEVEL>Ativas ").append(total).append(" | Pg ").append(page).append("/").append(pages).append("</font>");
+
+        if (total == 0) {
+            int fila; synchronized (queue) { fila = queue.size(); }
+            sb.append("<br1>").append(fila >= 2 ? "Aguardando batalhas..." : "Sem lutas. Entre na fila!")
+              .append(" Fila: ").append(fila);
+        } else {
+            for (int i = from; i < to; i++) {
+                final DuelSession ds = sessions.get(i);
+                sb.append("<br1>")
+                  .append(HtmlUtil.escape(ds.nameA)).append(" vs ").append(HtmlUtil.escape(ds.nameB))
+                  .append(" [#").append(ds.duelId).append("] ")
+                  .append("<button value=\"Ver\" action=\"bypass -h voiced_pvpfarmwatch ").append(ds.duelId).append("\">");
+            }
+            // paginacao compacta
+            sb.append(buildPaginationBar(page, pages));
+        }
+
+        sb.append("<br1><button value=\"Sair Obs\" action=\"bypass -h voiced_pvpfarmunwatch\">");
+        sb.append("</center></body></html>");
+
+        String html = COMPACT_HTML ? compactHtml(sb.toString()) : sb.toString();
+        if (html.getBytes(StandardCharsets.UTF_8).length > MAX_HTML_BYTES) {
+            html = "<html><body><center><font color=LEVEL>PvP Farm</font><br1><font color=FF9999>HTML grande; mude de página.</font></center></body></html>";
+        }
+        return html;
+    }
+
+
+    // chamado pelo seu voiced/npc: pvpfarmduels [page]
+    public String handleDuelsHtmlCommand(int page) {
+        return buildDuelsHtml(page);
+    }
+
+    // chamado pelo seu voiced: pvpfarmwatch <duelId>
+    public void watch(Player player, int duelId) {
+        if (player == null) return;
+
+        // já está observando algo?
+        if (observerIndex.containsKey(player.getObjectId())) {
+            player.sendMessage("Voce ja esta observando uma luta. Use o botao 'Parar de Observar' primeiro.");
+            return;
+        }
+
+        final DuelSession target = findDuelById(duelId);
+        if (target == null || !target.active) {
+            player.sendMessage("Esta luta nao esta mais ativa.");
+            return;
+        }
+
+        if (target.addObserver(player)) {
+            observerIndex.put(player.getObjectId(), target);
+        } else {
+            player.sendMessage("Falha ao observar a luta.");
+        }
+    }
+
+    // chamado pelo voiced: pvpfarmunwatch
+    public void stopWatching(Player player) {
+        if (player == null) return;
+        final DuelSession ds = observerIndex.remove(player.getObjectId());
+        if (ds != null) {
+            ds.removeObserver(player, true);
+            player.sendMessage("Voce parou de observar.");
+        }
+    }
+
+    private DuelSession findDuelById(int duelId) {
+        // percorre snapshot único
+        for (DuelSession ds : getActiveDuelSessionsSnapshot()) {
+            if (ds.duelId == duelId) return ds;
+        }
+        return null;
+    }
+
+    private List<DuelSession> getActiveDuelSessionsSnapshot() {
+        final HashSet<DuelSession> uniq = new HashSet<>();
+        for (DuelSession ds : duels.values()) {
+            if (ds != null && ds.active) uniq.add(ds);
+        }
+        return new ArrayList<>(uniq);
+    }
+
+    // ======================== RECOMPENSAS / UTILS ========================
+
+    private static void giveReward(Player p) {
+        if (p == null) return;
+        if (REWARDS == null || REWARDS.length == 0) {
+            p.sendMessage("[PvP Farm] Nenhuma recompensa ativa. Verifique EVEN_PVP_FARM_REWARDS_WINNER.");
+            return;
+        }
+        final Map<Integer, Integer> aggregated = new HashMap<>();
+        for (int[] r : REWARDS) {
+            final int id = r[0], min = r[1], max = r[2], chance = r[3];
+            if (chance < 100) {
+                int roll = ThreadLocalRandom.current().nextInt(100);
+                if (roll >= chance) continue;
+            }
+            int amount = (min == max) ? min : ThreadLocalRandom.current().nextInt(min, max + 1);
+            if (amount <= 0) continue;
+            aggregated.merge(id, amount, Integer::sum);
+        }
+        if (aggregated.isEmpty()) {
+            p.sendMessage("Nenhuma recompensa desta vez.");
+            return;
+        }
+        final StringBuilder sb = new StringBuilder("Recompensas: ");
+        boolean any = false;
+        for (Map.Entry<Integer, Integer> e : aggregated.entrySet()) {
+            final int id = e.getKey();
+            final int amount = e.getValue();
+            if (amount <= 0) continue;
+
+            p.addItem("PvPFarmReward", id, amount, p, true);
+
+            if (any) sb.append(" | ");
+            final String name = getItemNameSafe(id);
+            sb.append("+").append(amount).append(" ").append(name);
+            any = true;
+        }
+        p.sendMessage(any ? sb.toString() : "Nenhuma recompensa desta vez.");
+    }
+
+    private static void broadcastAll(String msg) {
+        for (Player pl : World.getInstance().getPlayers()) {
+            if (pl != null) pl.sendMessage(msg);
+        }
+    }
+
+    private static void unfreeze(Player player, boolean revive) {
+        if (player == null) return;
+
+        if (revive && player.isAlikeDead()) player.doRevive();
+
+        player.setCurrentHpMp(player.getMaxHp(), player.getMaxMp());
+        player.setCurrentCp(player.getMaxCp());
+
+        player.abortAttack();
+        player.abortCast();
+        player.setTarget(null);
+
+        player.enableAllSkills();
+
+        if (player.isSitting()) {
+            try { player.standUp(); } catch (Exception ignored) {}
+        }
+
+        if (player.getAI() != null) {
+            player.getAI().setIntention(CtrlIntention.ACTIVE);
+        }
+
+        try { player.stopAbnormalEffect(0x0800); } catch (Throwable ignored) {}
+        try { player.setIsParalyzed(false); } catch (Throwable ignored) {}
+
+        player.broadcastUserInfo();
+    }
+
+    private static int[][] parseTripleList(String raw, int[][] fallback) {
+        try {
+            if (raw != null) raw = raw.trim();
+            if (raw == null || raw.isEmpty()) return fallback;
+            final List<int[]> list = new ArrayList<>();
+            for (String part : raw.split(";")) {
+                final String s = part.trim();
+                if (s.isEmpty()) continue;
+                final String[] xyz = s.split(",");
+                if (xyz.length < 3) continue;
+                int x = Integer.parseInt(xyz[0].trim());
+                int y = Integer.parseInt(xyz[1].trim());
+                int z = Integer.parseInt(xyz[2].trim());
+                list.add(new int[] {x,y,z});
+            }
+            return list.isEmpty() ? fallback : list.toArray(new int[list.size()][]);
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private static List<int[]> parseRoomsList(String raw, List<int[]> fallback) {
+        try {
+            if (raw != null) raw = raw.trim();
+            if (raw == null || raw.isEmpty()) return new ArrayList<>(fallback);
+            final List<int[]> list = new ArrayList<>();
+            for (String part : raw.split(";")) {
+                final String s = part.trim();
+                if (s.isEmpty()) continue;
+                final String[] xyz = s.split(",");
+                if (xyz.length < 3) continue;
+                int x = Integer.parseInt(xyz[0].trim());
+                int y = Integer.parseInt(xyz[1].trim());
+                int z = Integer.parseInt(xyz[2].trim());
+                list.add(new int[] {x,y,z});
+            }
+            return list.isEmpty() ? new ArrayList<>(fallback) : list;
+        } catch (Exception e) {
+            return new ArrayList<>(fallback);
+        }
+    }
+
+    private static int[][] parseRewardsToArray(String raw) {
+        if (raw == null) raw = "";
+        raw = raw.trim();
+        if (raw.isEmpty()) return defaultRewards();
+
+        final List<int[]> out = new ArrayList<>();
+        for (String e : raw.split(";")) {
+            final String s = e.trim();
+            if (s.isEmpty()) continue;
+            final String[] p = s.split(",");
+            if (p.length < 4) continue;
+            try {
+                int id  = Integer.parseInt(p[0].trim());
+                int min = Math.max(0, Integer.parseInt(p[1].trim()));
+                int max = Math.max(min, Integer.parseInt(p[2].trim()));
+                int ch  = Integer.parseInt(p[3].trim());
+                if (ch < 0) ch = 0;
+                if (ch > 100) ch = 100;
+                out.add(new int[] { id, min, max, ch });
+            } catch (Exception ignored) {}
+        }
+        return out.isEmpty() ? defaultRewards() : out.toArray(new int[out.size()][]);
+    }
+
+    private static int[][] defaultRewards() {
+        return new int[][] {
+            { ConfigVariables.EVEN_PVP_FARM_REWARD_ITEM_ID,
+              ConfigVariables.EVEN_PVP_FARM_REWARD_ITEM_QTY,
+              ConfigVariables.EVEN_PVP_FARM_REWARD_ITEM_QTY,
+              100 }
+        };
+    }
+
+    public void onDie(Creature victim, Creature killer) { if (!(victim instanceof Player)) return; }
+
+    private static void dismissCompanions(Player p) {
+        if (p == null) return;
+        try { if (p.isMounted()) p.dismount(); } catch (Throwable ignored) {}
+        try { if (p.getPet() != null) p.getPet().unSummon(p); } catch (Throwable ignored) {}
+    }
+
+    public boolean isInThisEvent(Player p) { return p != null && isInThisEvent(p.getObjectId()); }
+    public boolean isInThisEvent(int objId) { return participants.contains(objId); }
+    public boolean isParticipant(Player p) { return p != null && participants.contains(p.getObjectId()); }
+    private void markParticipant(int objId) { participants.add(objId); }
+    private void unmarkParticipant(int objId) { participants.remove(objId); }
+
+    private static String getItemNameSafe(int itemId) {
+        try {
+            final Item it = ItemTable.getInstance().getTemplate(itemId);
+            if (it != null && it.getName() != null && !it.getName().isEmpty()) return it.getName();
+        } catch (Throwable ignored) {}
+        return "ItemID " + itemId;
+    }
+
+    // ======================== DUELO ========================
+
+    private class DuelSession {
+        private final int duelId = NEXT_DUEL_ID.getAndIncrement();
+        private final int p1Id, p2Id;
+        private final String nameA, nameB;
+        private final int[] l1, l2;
+
+        private volatile boolean active = false;
+        private ScheduledFuture<?> watcher;
+
+        private Instance inst;
+
+        private final Set<Integer> observers = Collections.newSetFromMap(new ConcurrentHashMap<>());
+        private final Map<Integer, int[]> lastObsLoc = new ConcurrentHashMap<>();
+
+        DuelSession(int p1Id, int p2Id, int[] l1, int[] l2) {
+            this.p1Id = p1Id;
+            this.p2Id = p2Id;
+            this.l1 = l1;
+            this.l2 = l2;
+
+            final Player a = World.getInstance().getPlayer(p1Id);
+            final Player b = World.getInstance().getPlayer(p2Id);
+            this.nameA = (a != null ? a.getName() : "???");
+            this.nameB = (b != null ? b.getName() : "???");
+        }
+
+        void start() {
+            final Player p1 = World.getInstance().getPlayer(p1Id);
+            final Player p2 = World.getInstance().getPlayer(p2Id);
+            if (p1 == null || p2 == null) return;
+
+            final int iid = InstanceManager.getInstance().createInstanceId();
+            inst = InstanceManager.getInstance().getInstance(iid);
+
+            dismissCompanions(p1);
+            dismissCompanions(p2);
+
+            p1.setInstanceDungeon(inst, false);
+            p2.setInstanceDungeon(inst, false);
+
+            unfreeze(p1, false);
+            unfreeze(p2, false);
+
+            p1.teleToLocation(l1[0], l1[1], l1[2], 0);
+            p2.teleToLocation(l2[0], l2[1], l2[2], 0);
+
+            p1.sendMessage("[Duelo] Derrote seu oponente!");
+            p2.sendMessage("[Duelo] Derrote seu oponente!");
+
+            active = true;
+            watcher = ThreadPool.scheduleAtFixedRate(() -> {
+                if (!active) return;
+
+                final Player a = World.getInstance().getPlayer(p1Id);
+                final Player b = World.getInstance().getPlayer(p2Id);
+
+                if (a == null || a.isAlikeDead()) onWinner(b, a);
+                else if (b == null || b.isAlikeDead()) onWinner(a, b);
+            }, 1000L, 1000L);
+        }
+
+        boolean addObserver(Player obs) {
+            if (!active || obs == null) return false;
+
+            lastObsLoc.put(obs.getObjectId(), new int[] { obs.getX(), obs.getY(), obs.getZ(), obs.getHeading() });
+
+            obs.setInstanceDungeon(inst, false);
+
+            final int cx = (l1[0] + l2[0]) / 2;
+            final int cy = (l1[1] + l2[1]) / 2;
+            final int cz = (l1[2] + l2[2]) / 2;
+
+            try {
+                obs.enterObserverMode(cx, cy, cz); // modo nativo
+            } catch (Throwable t) {
+                // se sua source nao tiver observer nativo, ao menos teleporta o cara:
+                obs.teleToLocation(cx, cy, cz, 0);
+            }
+
+            observers.add(obs.getObjectId());
+            obs.sendMessage("[PvP Farm] Observando duelo. Use 'Parar de Observar' para sair.");
+            return true;
+        }
+
+        void removeObserver(Player obs, boolean restore) {
+            if (obs == null) return;
+            try { obs.leaveObserverMode(); } catch (Throwable ignored) {}
+            obs.setInstanceDungeon(inst,false);
+
+            if (restore) {
+                final int[] loc = lastObsLoc.remove(obs.getObjectId());
+                if (loc != null) obs.teleToLocation(loc[0], loc[1], loc[2], loc[3]);
+            } else {
+                lastObsLoc.remove(obs.getObjectId());
+            }
+            observers.remove(obs.getObjectId());
+        }
+
+        private void onWinner(Player winner, Player loser) {
+            if (!active) return;
+            active = false;
+
+            if (watcher != null) { watcher.cancel(false); watcher = null; }
+
+            // encerra observadores
+            for (Integer oid : new HashSet<>(observers)) {
+                final Player obs = World.getInstance().getPlayer(oid);
+                if (obs != null) removeObserver(obs, true);
+                observerIndex.remove(oid);
+            }
+            observers.clear();
+            lastObsLoc.clear();
+
+            if (winner == null) {
+                final Player a = World.getInstance().getPlayer(p1Id);
+                final Player b = World.getInstance().getPlayer(p2Id);
+
+                if (a != null) {
+                    unfreeze(a, true);
+                    a.setInstanceDungeon(inst, false);  // Remover a instância do jogador
+                    a.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                    ThreadPool.schedule(() -> unfreeze(a, false), 300);
+                    duels.remove(a.getObjectId());
+                    unmarkParticipant(a.getObjectId());
+                }
+                if (b != null) {
+                    unfreeze(b, true);
+                    b.setInstanceDungeon(inst,false);
+                    b.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                    ThreadPool.schedule(() -> unfreeze(b, false), 300);
+                    duels.remove(b.getObjectId());
+                    unmarkParticipant(b.getObjectId());
+                }
+                destroyInstanceSafe();
+                return;
+            }
+
+            final int winId = winner.getObjectId();
+            final int losId = (loser != null ? loser.getObjectId() : -1);
+
+            unfreeze(winner, false);
+            winner.sendMessage("[Duelo] Voce venceu! Indo para o farm exclusivo.");
+            if (AWARD_ON_WIN) giveReward(winner);
+
+            if (loser != null) {
+                loser.sendMessage("Voce perdeu o duelo.");
+                unfreeze(loser, true);
+                //REMOVENDO CORRETO O PERDEDOR!
+                loser.setInstanceDungeon(InstanceManager.getInstance().getInstance(0), true); // Remove o perdedor da instância
+                loser.setDuelArena(false);
+                loser.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                ThreadPool.schedule(() -> unfreeze(loser, false), 300);
+                unmarkParticipant(losId);
+            }
+
+            duels.remove(winId);
+            if (losId != -1) duels.remove(losId);
+
+            destroyInstanceSafe();
+            startFarm(winner);
+        }
+
+        void forceStop(String reason) {
+            if (!active) return;
+            active = false;
+
+            if (watcher != null) { watcher.cancel(false); watcher = null; }
+
+            for (Integer oid : new HashSet<>(observers)) {
+                final Player obs = World.getInstance().getPlayer(oid);
+                if (obs != null) removeObserver(obs, true);
+                observerIndex.remove(oid);
+            }
+            observers.clear();
+            lastObsLoc.clear();
+
+            final Player a = World.getInstance().getPlayer(p1Id);
+            final Player b = World.getInstance().getPlayer(p2Id);
+
+            if (a != null) {
+                a.sendMessage("[Duelo] Encerrado: " + reason);
+                unfreeze(a, true);
+                a.setInstanceDungeon(inst,false);
+                a.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                ThreadPool.schedule(() -> unfreeze(a, false), 300);
+                duels.remove(a.getObjectId());
+                unmarkParticipant(a.getObjectId());
+            }
+            if (b != null) {
+                b.sendMessage("[Duelo] Encerrado: " + reason);
+                unfreeze(b, true);
+                b.setInstanceDungeon(inst,false);
+                b.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                ThreadPool.schedule(() -> unfreeze(b, false), 300);
+                duels.remove(b.getObjectId());
+                unmarkParticipant(b.getObjectId());
+            }
+            destroyInstanceSafe();
+        }
+
+        private void destroyInstanceSafe() {
+            if (inst != null && inst.getId() > 0) {
+                try { InstanceManager.getInstance().destroyInstance(inst.getId()); } catch (Throwable ignored) {}
+                inst = null;
+            }
+        }
+    }
+
+    // ======================== FARM ========================
+
+    private void startFarm(Player p) {
+        if (p == null) return;
+        final int room = acquireRoom();
+        if (room == -1) {
+            p.sendMessage("Todas as salas estao ocupadas.");
+            if (!AWARD_ON_WIN) {
+                p.sendMessage("Recebendo recompensas.");
+                giveReward(p);
+            }
+            unfreeze(p, false);
+            p.setInstanceDungeon(inst, false);
+            p.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+            ThreadPool.schedule(() -> unfreeze(p, false), 300);
+            unmarkParticipant(p.getObjectId());
+            return;
+        }
+
+        final int[] base = FARM_ROOMS.get(room);
+        final FarmSession f = new FarmSession(p.getObjectId(), room, base[0], base[1], base[2]);
+        farms.put(p.getObjectId(), f);
+        f.start();
+    }
+
+    private int acquireRoom() {
+        synchronized (busyRooms) {
+            for (int i = 0; i < FARM_ROOMS.size(); i++) {
+                if (!busyRooms.contains(i)) { busyRooms.add(i); return i; }
+            }
+        }
+        return -1;
+    }
+
+    private void releaseRoom(int idx) { busyRooms.remove(idx); }
+
+    private class FarmSession {
+        private final int playerId;
+        private final int roomIndex;
+        private final int cx, cy, cz;
+
+        private final List<L2Spawn> spawns = new ArrayList<>();
+        private volatile boolean active = false;
+        private ScheduledFuture<?> endTask;
+
+        private Instance inst;
+
+        FarmSession(int playerId, int roomIndex, int cx, int cy, int cz) {
+            this.playerId = playerId;
+            this.roomIndex = roomIndex;
+            this.cx = cx; this.cy = cy; this.cz = cz;
+        }
+
+        void start() {
+            final Player p = World.getInstance().getPlayer(playerId);
+            if (p == null) { cleanup(); return; }
+
+            final int iid = InstanceManager.getInstance().createInstanceId();
+            inst = InstanceManager.getInstance().getInstance(iid);
+
+            p.setInstanceDungeon(inst, false);
+
+            unfreeze(p, false);
+            p.teleToLocation(cx, cy, cz, 0);
+            ThreadPool.schedule(() -> unfreeze(p, false), 200);
+
+            p.sendMessage("[Farm] Sala exclusiva por " + TimeUnit.MILLISECONDS.toMinutes(ConfigVariables.EVEN_PVP_FARM_FARM_DURATION_MS) + " min.");
+
+            spawnMobs();
+
+            active = true;
+            endTask = ThreadPool.schedule(this::finishSafe, ConfigVariables.EVEN_PVP_FARM_FARM_DURATION_MS);
+        }
+
+        private void spawnMobs() {
+            final NpcTemplate tpl = NpcTable.getInstance().getTemplate(ConfigVariables.EVEN_PVP_FARM_FARM_MOB_ID);
+            if (tpl == null) return;
+
+            for (int i = 0; i < ConfigVariables.EVEN_PVP_FARM_FARM_MOB_COUNT; i++) {
+                final int dx = ThreadLocalRandom.current().nextInt(-250, 251);
+                final int dy = ThreadLocalRandom.current().nextInt(-250, 251);
+                final int x = cx + dx;
+                final int y = cy + dy;
+                final int z = cz;
+
+                try {
+                    final L2Spawn s = new L2Spawn(tpl);
+                    s.setLoc(x, y, z, 0);
+                    s.setRespawnDelay(0);
+
+                    SpawnTable.getInstance().addSpawn(s, false);
+                    s.doSpawn(false);
+
+                    if (s.getNpc() != null) {
+                        s.getNpc().setInstanceDungeon(inst, false);
+                    }
+
+                    spawns.add(s);
+                } catch (Exception ignored) {}
+            }
+        }
+
+        private void finishSafe() {
+            if (!active) return;
+            active = false;
+
+            final Player p = World.getInstance().getPlayer(playerId);
+            if (p != null) {
+                p.sendMessage("[Farm] Tempo encerrado!");
+                if (!AWARD_ON_WIN) {
+                    p.sendMessage("[Farm] Recebendo recompensas.");
+                    giveReward(p);
+                }
+
+                unfreeze(p, false);
+                //REMOVENDO DA INSTANCIA CORRETAMENTE
+                p.setInstanceDungeon(InstanceManager.getInstance().getInstance(0), true); // Remove o perdedor da instância
+                p.setDuelArena(false);
+                p.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                ThreadPool.schedule(() -> unfreeze(p, false), 200);
+            }
+            cleanup();
+        }
+
+        void forceStop(String reason) {
+            if (!active) return;
+            active = false;
+
+            if (endTask != null) { endTask.cancel(false); endTask = null; }
+
+            final Player p = World.getInstance().getPlayer(playerId);
+            if (p != null) {
+                p.sendMessage("[Farm] Encerrado: " + reason);
+                unfreeze(p, true);
+                p.setInstanceDungeon(inst, false);
+                p.teleToLocation(TOWN_X, TOWN_Y, TOWN_Z, 0);
+                ThreadPool.schedule(() -> unfreeze(p, false), 200);
+            }
+
+            cleanup();
+        }
+
+        private void cleanup() {
+            for (L2Spawn s : spawns) {
+                try {
+                    if (s.getNpc() != null) {
+                        try { s.getNpc().setInstanceDungeon(inst, true); } catch (Throwable ignored) {}
+                    }
+                    SpawnTable.getInstance().deleteSpawn(s, false);
+                } catch (Exception ignored) {}
+            }
+            spawns.clear();
+
+            releaseRoom(roomIndex);
+            farms.remove(playerId);
+            unmarkParticipant(playerId);
+
+            if (inst != null && inst.getId() > 0) {
+                try { InstanceManager.getInstance().destroyInstance(inst.getId()); } catch (Throwable ignored) {}
+                inst = null;
+            }
+        }
+    }
+
+    // ======================== AUXILIARES ========================
+
+    private static final class SetOfTimes {
+        private String raw = "";
+        private final HashSet<String> set = new HashSet<>();
+
+        boolean rawEquals(String r) { return r != null && r.equals(raw); }
+
+        void setFrom(String r) {
+            raw = (r == null) ? "" : r;
+            set.clear();
+            final StringTokenizer st = new StringTokenizer(raw, ";");
+            while (st.hasMoreTokens()) {
+                final String hhmm = st.nextToken().trim();
+                if (hhmm.length() == 5 && hhmm.charAt(2) == ':') set.add(hhmm);
+            }
+        }
+
+        boolean contains(String hhmm) { return set.contains(hhmm); }
+    }
+
+    // === API exposta ao Panel ===
+
+    /** Quantos jogadores estão na fila agora (Thread-safe). */
+    public int getQueueSize() {
+        synchronized (queue) {
+            return queue.size();
+        }
+    }
+
+    /** Status atual do evento. */
+    public boolean isRunning() {
+        return running;
+    }
+
+    /** View mínima de um duelo ativo para a UI do painel. */
+    public static final class DuelView {
+        public final int duelId;
+        public final String nameA;
+        public final String nameB;
+        public final boolean active;
+
+        public DuelView(int duelId, String nameA, String nameB, boolean active) {
+            this.duelId = duelId;
+            this.nameA = nameA;
+            this.nameB = nameB;
+            this.active = active;
+        }
+    }
+
+    /** Snapshot dos duelos ativos, no formato leve para o painel. */
+    public java.util.List<DuelView> getActiveDuels() {
+        final java.util.List<DuelView> out = new java.util.ArrayList<>();
+        for (DuelSession ds : getActiveDuelSessionsSnapshot()) {
+            final String a = (ds.nameA != null) ? ds.nameA : "?";
+            final String b = (ds.nameB != null) ? ds.nameB : "?";
+            out.add(new DuelView(ds.duelId, a, b, ds.active));
+        }
+        return out;
+    }
+    /** Gera HTML ultra-compacto (menos tags/espacos). */
+    private static final boolean COMPACT_HTML = true;
+
+    /** Remove comentarios, quebras e espacos redundantes. */
+    private static String compactHtml(String s) {
+        if (s == null) return null;
+        // remove <!-- ... -->
+        s = s.replaceAll("(?s)<!--.*?-->", "");
+        // normaliza quebras
+        s = s.replace("\r", "");
+        // remove espacos entre tags
+        s = s.replaceAll(">\\s+<", "><");
+        // colapsa espacos repetidos
+        s = s.replaceAll("\\s{2,}", " ");
+        return s.trim();
+    }       
+}
